@@ -1,5 +1,8 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Linq.Expressions;
+using System.Reflection;
 using System.Text;
 using HotChocolate.Configuration;
 using HotChocolate.Language;
@@ -11,9 +14,10 @@ using static HotChocolate.ApolloFederation.ThrowHelper;
 
 namespace HotChocolate.ApolloFederation
 {
-    internal class EntityTypeInterceptor : TypeInterceptor
+    internal class FederationTypeInterceptor : TypeInterceptor
     {
         private readonly List<ObjectType> _entityTypes = new List<ObjectType>();
+        private static readonly object _empty = new object();
 
         public override bool TriggerAggregations { get; } = true;
 
@@ -40,6 +44,16 @@ namespace HotChocolate.ApolloFederation
             }
         }
 
+        public override void OnAfterCompleteType(
+            ITypeCompletionContext completionContext,
+            DefinitionBase? definition,
+            IDictionary<string, object?> contextData)
+        {
+            AddFactoryMethodToContext(
+                completionContext,
+                contextData);
+        }
+
         public override void OnBeforeCompleteType(
             ITypeCompletionContext completionContext,
             DefinitionBase definition,
@@ -54,6 +68,59 @@ namespace HotChocolate.ApolloFederation
                 definition);
         }
 
+        private void AddFactoryMethodToContext(
+            ITypeCompletionContext completionContext,
+            IDictionary<string, object?> contextData)
+        {
+            if (completionContext.Type is ObjectType ot && ot.ToRuntimeType() is var rt &&
+                rt.IsDefined(typeof(ForeignServiceTypeExtensionAttribute)))
+            {
+                var memberInfos = rt.GetMembers().Where(member => member.IsDefined(typeof(ExternalAttribute)));
+                var representationArgument = Expression.Parameter(typeof(Representation));
+
+                // Create bind expressions for all properties of a type
+                // that were marked as external. If they are not passed, the
+                // properties are filled with null.
+                var bindExpressions = memberInfos.Select(
+                    memberInfo =>
+                    {
+                        // Representations passed from other services must not be wholly defined.
+                        // Fill the properties that were passed and pass null if a property
+                        // wasn't passed.
+                        Func<ObjectFieldNode?, object?> objectOrNull = field =>
+                            field == null
+                                ? null
+                                : field.Value.Value;
+
+                        Expression<Func<Representation, object?>> valueGetterFunc =
+                            (representation) =>
+                                objectOrNull(representation.Data.Fields
+                                    .SingleOrDefault(item =>
+                                        item.Name.Value.Equals(memberInfo.Name, StringComparison.OrdinalIgnoreCase)));
+
+                        if (memberInfo is PropertyInfo pi)
+                        {
+                            return Expression.Bind(
+                                memberInfo,
+                                Expression.Convert(Expression.Invoke(
+                                    valueGetterFunc,
+                                    representationArgument
+                                ), pi.PropertyType)
+                            );
+                        }
+                        throw ExternalAttribute_InvalidTarget(rt, memberInfo);
+                    }
+                );
+
+                var objectFactoryMethodExpression = Expression.Lambda(
+                    Expression.MemberInit(Expression.New(rt), bindExpressions),
+                    representationArgument
+                );
+
+                contextData[EntityResolver] = objectFactoryMethodExpression.Compile();
+            }
+        }
+
         private void AddServiceTypeToQueryType(
             ITypeCompletionContext completionContext,
             DefinitionBase definition)
@@ -61,13 +128,30 @@ namespace HotChocolate.ApolloFederation
             if (completionContext.IsQueryType == true &&
                 definition is ObjectTypeDefinition objectTypeDefinition)
             {
-                var fieldDescriptor = ObjectFieldDescriptor.New(
+                var serviceFieldDescriptor = ObjectFieldDescriptor.New(
                     completionContext.DescriptorContext,
                     WellKnownFieldNames.Service);
-                fieldDescriptor
+                serviceFieldDescriptor
                     .Type<NonNullType<ServiceType>>()
-                    .Resolver(default(object));
-                objectTypeDefinition.Fields.Add(fieldDescriptor.CreateDefinition());
+                    .Resolve(_empty);
+                objectTypeDefinition.Fields.Add(serviceFieldDescriptor.CreateDefinition());
+
+                var entitiesFieldDescriptor = ObjectFieldDescriptor.New(
+                    completionContext.DescriptorContext,
+                    WellKnownFieldNames.Entities);
+                entitiesFieldDescriptor
+                    .Type<NonNullType<ListType<EntityType>>>()
+                    .Argument(
+                        WellKnownArgumentNames.Representations,
+                        descriptor =>
+                            descriptor.Type<NonNullType<ListType<NonNullType<AnyType>>>>()
+                    )
+                    .Resolve(c => EntitiesResolver._Entities(
+                        c.Schema,
+                        c.ArgumentValue<IReadOnlyList<Representation>>(WellKnownArgumentNames.Representations),
+                        c
+                    ));
+                objectTypeDefinition.Fields.Add(entitiesFieldDescriptor.CreateDefinition());
             }
         }
 
